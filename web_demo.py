@@ -40,6 +40,12 @@ def load_parameter(model_name: str, engine_use: bool):
         new_model = ChatGLMForConditionalGeneration(configuration)
     
     new_model.load_state_dict(model.state_dict(), strict=True)
+    if engine_use:
+        for i in range(configuration.num_layers):
+            new_model.transformer.layers[i].attention.query_key_value.weight.data = new_model.transformer.layers[i].attention.query_key_value.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].attention.dense.weight.data = new_model.transformer.layers[i].attention.dense.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data = new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data = new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data.transpose(0, 1).contiguous()
 
     return new_model
 
@@ -123,7 +129,7 @@ def predict_1(input, chatbot, history):
     model_1.transformer.first_token_latency = 0
     model_1.transformer.forward_count = 0
     model_1.past_key_values = None
-    for response, history in model_1.stream_chat(tokenizer_1, input, history=[]):
+    for response, history in model_1.stream_chat(tokenizer_1, input, history=[], do_sample=False):
         chatbot[-1] = (parse_text(input), parse_text(response))   
         yield chatbot, history, "……", "……"
     end_to_end = model_1.transformer.duration
@@ -143,7 +149,7 @@ def predict_2(input, chatbot, history):
     model_2.transformer.first_token_latency = 0
     model_2.transformer.forward_count = 0
     model_2.past_key_values = None
-    for response, history in model_2.stream_chat(tokenizer_2, input, history=[]):
+    for response, history in model_2.stream_chat(tokenizer_2, input, history=[], do_sample=False):
         chatbot[-1] = (parse_text(input), parse_text(response))   
         yield chatbot, history, "……", "……"
     end_to_end = model_2.transformer.duration
@@ -282,5 +288,5 @@ with gr.Blocks() as demo:
     emptyBtn.click(reset_state, outputs=[chatbot_1, history_1, chatbot_2, history_2], show_progress=True)
 
 # demo.queue().launch(share=False, inbrowser=True)
-demo.queue(concurrency_count=3)
+demo.queue(concurrency_count=10)
 demo.launch(share=True, inbrowser=True)

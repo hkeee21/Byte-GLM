@@ -453,7 +453,8 @@ class SelfAttention(torch.nn.Module):
         # torch.cuda.synchronize()
         # l1_st = time.time()
         # [seq_len, batch, 3 * hidden_size]
-        mixed_raw_layer = self.query_key_value(hidden_states)
+        # mixed_raw_layer = self.query_key_value(hidden_states)
+        mixed_raw_layer = torch.matmul(hidden_states, self.query_key_value.weight) + self.query_key_value.bias
         # torch.cuda.synchronize()
         # l1_ed = time.time()
         # print("l1: %.4f ms" % ((l1_ed-l1_st)*1000))
@@ -593,7 +594,8 @@ class SelfAttention(torch.nn.Module):
         #             print("%.4f" % context_layer[s, 0, h], end=' ')
         #         print('')
 
-        output = self.dense(context_layer)
+        # output = self.dense(context_layer)
+        output = torch.matmul(context_layer, self.dense.weight) + self.dense.bias
 
         outputs = (output, present)
 
@@ -654,12 +656,14 @@ class GLU(torch.nn.Module):
         """
 
         # [seq_len, batch, inner_hidden_size]
-        intermediate_parallel = self.dense_h_to_4h(hidden_states)
+        # intermediate_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel = torch.matmul(hidden_states, self.dense_h_to_4h.weight) + self.dense_h_to_4h.bias
 
         # intermediate_parallel = self.activation_func(intermediate_parallel)
         gelu_cuda(intermediate_parallel)
 
-        output = self.dense_4h_to_h(intermediate_parallel)
+        # output = self.dense_4h_to_h(intermediate_parallel)
+        output = torch.matmul(intermediate_parallel, self.dense_4h_to_h.weight) + self.dense_4h_to_h.bias
 
         return output
 
@@ -904,52 +908,63 @@ class GLMBlockByte(torch.nn.Module):
             if layer_id == 0 and forward_count == 1:
                 print("seq len: ", seq_len)
 
-            if self.attention_query_key_value_weight.size(0) == 1:
-                # print("transpose for weight starts ...")
-                attention_query_key_value_weight = self.attention.query_key_value.weight.transpose(0, 1).contiguous()
-                attention_dense_weight = self.attention.dense.weight.transpose(0, 1).contiguous()
-                dense_h_to_4h_weight = self.mlp.dense_h_to_4h.weight.transpose(0, 1).contiguous()
-                dense_4h_to_h_weight = self.mlp.dense_4h_to_h.weight.transpose(0, 1).contiguous()
-                # print(dense_4h_to_h_weight.shape)
-                # print(self.mlp.dense_4h_to_h.weight.shape)
+            # if self.attention_query_key_value_weight.size(0) == 1:
+            #     # print("transpose for weight starts ...")
+            #     attention_query_key_value_weight = self.attention.query_key_value.weight.transpose(0, 1).contiguous()
+            #     attention_dense_weight = self.attention.dense.weight.transpose(0, 1).contiguous()
+            #     dense_h_to_4h_weight = self.mlp.dense_h_to_4h.weight.transpose(0, 1).contiguous()
+            #     dense_4h_to_h_weight = self.mlp.dense_4h_to_h.weight.transpose(0, 1).contiguous()
+            #     # print(dense_4h_to_h_weight.shape)
+            #     # print(self.mlp.dense_4h_to_h.weight.shape)
 
-            # out1 = F.layer_norm(hidden_states, (hidden_size, ),
-            #                              weight=self.input_layernorm.weight, bias=self.input_layernorm.bias,
-            #                              eps=self.layernorm_eps)
+            # # out1 = F.layer_norm(hidden_states, (hidden_size, ),
+            # #                              weight=self.input_layernorm.weight, bias=self.input_layernorm.bias,
+            # #                              eps=self.layernorm_eps)
         
-            # fake_qkv = torch.matmul(out1, query_key_value_weight) + self.attention.query_key_value.bias
+            # # fake_qkv = torch.matmul(out1, query_key_value_weight) + self.attention.query_key_value.bias
 
-            # fake_qkv = fake_qkv.reshape((batch_size, seq_len, 
-            #                              self.num_attention_heads, 3 * self.hidden_size_per_attention_head))
+            # # fake_qkv = fake_qkv.reshape((batch_size, seq_len, 
+            # #                              self.num_attention_heads, 3 * self.hidden_size_per_attention_head))
 
-            # print(fake_qkv.shape)
+            # # print(fake_qkv.shape)
 
-            # fake_q, fake_k, fake_v = fake_qkv.chunk(3, dim=-1)
+            # # fake_q, fake_k, fake_v = fake_qkv.chunk(3, dim=-1)
 
-            # fake_k = fake_k.reshape((batch_size, seq_len, 
-            #              self.num_attention_heads, self.hidden_size_per_attention_head))
+            # # fake_k = fake_k.reshape((batch_size, seq_len, 
+            # #              self.num_attention_heads, self.hidden_size_per_attention_head))
             
-            # fake_k = fake_k.permute(1, 0, 2, 3).contiguous()
+            # # fake_k = fake_k.permute(1, 0, 2, 3).contiguous()
 
-                hidden_states, qkv_cache = torch.ops.ByteTransformer.BertTransformer(
-                    self.num_attention_heads, self.hidden_size_per_attention_head, self.num_layers, 
-                    attention_query_key_value_weight, self.attention.query_key_value.bias, 
-                    attention_dense_weight, self.attention.dense.bias,
-                    self.input_layernorm.weight, self.input_layernorm.bias,
-                    dense_h_to_4h_weight, self.mlp.dense_h_to_4h.bias, 
-                    dense_4h_to_h_weight, self.mlp.dense_4h_to_h.bias,
-                    self.post_attention_layernorm.weight, self.post_attention_layernorm.bias,
-                    hidden_states, attention_mask,
-                    False, False)
+            #     hidden_states, qkv_cache = torch.ops.ByteTransformer.BertTransformer(
+            #         self.num_attention_heads, self.hidden_size_per_attention_head, self.num_layers, 
+            #         attention_query_key_value_weight, self.attention.query_key_value.bias, 
+            #         attention_dense_weight, self.attention.dense.bias,
+            #         self.input_layernorm.weight, self.input_layernorm.bias,
+            #         dense_h_to_4h_weight, self.mlp.dense_h_to_4h.bias, 
+            #         dense_4h_to_h_weight, self.mlp.dense_4h_to_h.bias,
+            #         self.post_attention_layernorm.weight, self.post_attention_layernorm.bias,
+            #         hidden_states, attention_mask,
+            #         False, False)
             
-            else:
-                hidden_states, qkv_cache = torch.ops.ByteTransformer.BertTransformer(
+            # else:
+            #     hidden_states, qkv_cache = torch.ops.ByteTransformer.BertTransformer(
+            #         self.num_attention_heads, self.hidden_size_per_attention_head, self.num_layers, 
+            #         self.attention_query_key_value_weight, self.attention.query_key_value.bias, 
+            #         self.attention_dense_weight, self.attention.dense.bias,
+            #         self.input_layernorm.weight, self.input_layernorm.bias,
+            #         self.dense_h_to_4h_weight, self.mlp.dense_h_to_4h.bias, 
+            #         self.dense_4h_to_h_weight, self.mlp.dense_4h_to_h.bias,
+            #         self.post_attention_layernorm.weight, self.post_attention_layernorm.bias,
+            #         hidden_states, attention_mask,
+            #         False, False)
+
+            hidden_states, qkv_cache = torch.ops.ByteTransformer.BertTransformer(
                     self.num_attention_heads, self.hidden_size_per_attention_head, self.num_layers, 
-                    self.attention_query_key_value_weight, self.attention.query_key_value.bias, 
-                    self.attention_dense_weight, self.attention.dense.bias,
+                    self.attention.query_key_value.weight, self.attention.query_key_value.bias, 
+                    self.attention.dense.weight, self.attention.dense.bias,
                     self.input_layernorm.weight, self.input_layernorm.bias,
-                    self.dense_h_to_4h_weight, self.mlp.dense_h_to_4h.bias, 
-                    self.dense_4h_to_h_weight, self.mlp.dense_4h_to_h.bias,
+                    self.mlp.dense_h_to_4h.weight, self.mlp.dense_h_to_4h.bias, 
+                    self.mlp.dense_4h_to_h.weight, self.mlp.dense_4h_to_h.bias,
                     self.post_attention_layernorm.weight, self.post_attention_layernorm.bias,
                     hidden_states, attention_mask,
                     False, False)

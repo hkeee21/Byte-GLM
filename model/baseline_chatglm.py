@@ -1024,8 +1024,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         torch.cuda.synchronize()
         end = time.time()
         dur = (end - start) * 1000
-        if self.forward_count <= 3:
-            self.duration += dur
+        # if self.forward_count <= 3:
+        self.duration += dur
         if self.forward_count <= 2:
             self.first_token_latency += dur
         if self.forward_count == 1:

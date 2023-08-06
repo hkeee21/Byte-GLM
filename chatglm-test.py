@@ -40,12 +40,9 @@ def parse_text(text):
     text = "".join(lines)
     return text
 
-def load_parameter(model_name: str, seq_len: int):
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True).half().cuda()
+def load_parameter(model_name: str, engine_use: bool):
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True).half()
     model = model.eval()
-
-    tiny_bool = (seq_len <= 256)
-    # tiny_bool = False
 
     configuration = ChatGLMConfig(
         bos_token_id=130004, 
@@ -62,41 +59,22 @@ def load_parameter(model_name: str, seq_len: int):
         # tiny=tiny_bool
     )
 
-    # model = model.cpu()
-    if args.engine_use:
-        configuration.engine_use = args.engine_use
-        configuration.tiny = tiny_bool
+    if engine_use:
+        configuration.engine_use = True
         new_model = ChatGLMForConditionalGenerationByte(configuration)
     else:
         new_model = ChatGLMForConditionalGeneration(configuration)
     
-    new_model.transformer.word_embeddings.weight = model.transformer.word_embeddings.weight
-    new_model.lm_head.weight = model.lm_head.weight
-    for i in range(configuration.num_layers):
-        new_model.transformer.layers[i].input_layernorm.weight = model.transformer.layers[i].input_layernorm.weight
-        new_model.transformer.layers[i].input_layernorm.bias = model.transformer.layers[i].input_layernorm.bias
-        new_model.transformer.layers[i].attention.query_key_value.weight = model.transformer.layers[i].attention.query_key_value.weight
-        new_model.transformer.layers[i].attention.query_key_value.bias = model.transformer.layers[i].attention.query_key_value.bias
-        new_model.transformer.layers[i].attention.dense.weight = model.transformer.layers[i].attention.dense.weight
-        new_model.transformer.layers[i].attention.dense.bias = model.transformer.layers[i].attention.dense.bias
-        new_model.transformer.layers[i].post_attention_layernorm.weight = model.transformer.layers[i].post_attention_layernorm.weight
-        new_model.transformer.layers[i].post_attention_layernorm.bias = model.transformer.layers[i].post_attention_layernorm.bias
-        new_model.transformer.layers[i].mlp.dense_h_to_4h.weight = model.transformer.layers[i].mlp.dense_h_to_4h.weight
-        new_model.transformer.layers[i].mlp.dense_h_to_4h.bias = model.transformer.layers[i].mlp.dense_h_to_4h.bias
-        new_model.transformer.layers[i].mlp.dense_4h_to_h.weight = model.transformer.layers[i].mlp.dense_4h_to_h.weight
-        new_model.transformer.layers[i].mlp.dense_4h_to_h.bias = model.transformer.layers[i].mlp.dense_4h_to_h.bias
-        # load parameters into byte transformer backend
-        if tiny_bool and args.engine_use:
-            new_model.transformer.layers[i].attention_query_key_value_weight = model.transformer.layers[i].attention.query_key_value.weight.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].attention_dense_weight = model.transformer.layers[i].attention.dense.weight.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].dense_h_to_4h_weight = model.transformer.layers[i].mlp.dense_h_to_4h.weight.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].dense_4h_to_h_weight = model.transformer.layers[i].mlp.dense_4h_to_h.weight.transpose(0, 1).contiguous()
-    new_model.transformer.final_layernorm.weight = model.transformer.final_layernorm.weight
-    new_model.transformer.final_layernorm.bias = model.transformer.final_layernorm.bias
-    new_model.half().cuda()
-    new_model = new_model.eval()
+    new_model.load_state_dict(model.state_dict(), strict=True)
+    if engine_use:
+        for i in range(configuration.num_layers):
+            new_model.transformer.layers[i].attention.query_key_value.weight.data = new_model.transformer.layers[i].attention.query_key_value.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].attention.dense.weight.data = new_model.transformer.layers[i].attention.dense.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data = new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data.transpose(0, 1).contiguous()
+            new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data = new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data.transpose(0, 1).contiguous()
 
     return new_model
+
 
 if __name__ == '__main__': 
     parser = argparse.ArgumentParser()
@@ -142,5 +120,7 @@ if __name__ == '__main__':
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = load_parameter(model_name, args.seq_len)
+    model_1 = model.eval()
+    model_1.half().to("cuda:0")
     response, history = model.chat(tokenizer, parse_text(string), history=[])
     print(response)
