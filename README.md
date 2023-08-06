@@ -27,5 +27,5 @@
 
 ### TODO
   1. Single operator wrapper for convenience. 
-  2. Weight layout change in the backend. Weight layout adjustment costs 10% runtime in prefill stage.
+  2. Weight layout change in the backend. Weight layout adjustment costs 10% runtime in prefill stage. [done]
   3. Fix fused attention kernel for large dim and rotary embedding.
