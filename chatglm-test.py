@@ -1,13 +1,14 @@
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_chatglm import ChatGLMForConditionalGenerationByte
 from model.baseline_chatglm import ChatGLMForConditionalGeneration
+from model.chatglm_with_custom_ops import ChatGLMForConditionalGenerationCustomVersion
 from model.configuration_chatglm import ChatGLMConfig
 import argparse
 import yaml
 import os
 import torch
 
-
+local_cache_dir = "/share/zhaoyingzhuo"
 def parse_text(text):
     """copy from https://github.com/GaiZhenbiao/ChuanhuChatGPT/"""
     lines = text.split("\n")
@@ -41,7 +42,7 @@ def parse_text(text):
     return text
 
 def load_parameter(model_name: str, engine_use: bool):
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True).half()
+    model = AutoModel.from_pretrained(model_name, cache_dir=local_cache_dir, trust_remote_code=True).half()
     model = model.eval()
 
     configuration = ChatGLMConfig(
@@ -60,18 +61,19 @@ def load_parameter(model_name: str, engine_use: bool):
     )
 
     if engine_use:
-        configuration.engine_use = True
-        new_model = ChatGLMForConditionalGenerationByte(configuration)
+        # configuration.engine_use = True
+        print('the model is custom one')
+        new_model = ChatGLMForConditionalGenerationCustomVersion(configuration)
     else:
+        print('the model is original one')
         new_model = ChatGLMForConditionalGeneration(configuration)
-    
-    new_model.load_state_dict(model.state_dict(), strict=True)
-    if engine_use:
-        for i in range(configuration.num_layers):
-            new_model.transformer.layers[i].attention.query_key_value.weight.data = new_model.transformer.layers[i].attention.query_key_value.weight.data.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].attention.dense.weight.data = new_model.transformer.layers[i].attention.dense.weight.data.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data = new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data.transpose(0, 1).contiguous()
-            new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data = new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data.transpose(0, 1).contiguous()
+    new_model.load_state_dict(model.state_dict(), strict=False)
+    # if engine_use:
+    #     for i in range(configuration.num_layers):
+    #         new_model.transformer.layers[i].attention.query_key_value.weight.data = new_model.transformer.layers[i].attention.query_key_value.weight.data.transpose(0, 1).contiguous()
+    #         new_model.transformer.layers[i].attention.dense.weight.data = new_model.transformer.layers[i].attention.dense.weight.data.transpose(0, 1).contiguous()
+    #         new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data = new_model.transformer.layers[i].mlp.dense_h_to_4h.weight.data.transpose(0, 1).contiguous()
+    #         new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data = new_model.transformer.layers[i].mlp.dense_4h_to_h.weight.data.transpose(0, 1).contiguous()
 
     return new_model
 
@@ -82,11 +84,6 @@ if __name__ == '__main__':
     parser.add_argument('--test-case', type=int, default=-1)
     parser.add_argument('--engine-use', default=False, action='store_true')
     args = parser.parse_args()
-
-    torch.ops.load_library('./lib/libths_bytetransformer.so')
-
-    assert args.seq_len > -1 or args.test_case > -1, \
-        "either seq len or test case should be assigned !"
 
     string = " "
     if args.seq_len == 8:
@@ -118,8 +115,8 @@ if __name__ == '__main__':
     string = file[case_id]
     model_name = "THUDM/chatglm-6b"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = load_parameter(model_name, args.seq_len)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=local_cache_dir, trust_remote_code=True)
+    model = load_parameter(model_name, args.engine_use)
     model_1 = model.eval()
     model_1.half().to("cuda:0")
     response, history = model.chat(tokenizer, parse_text(string), history=[])
