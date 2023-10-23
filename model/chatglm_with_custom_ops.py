@@ -33,6 +33,8 @@ from transformers.generation.utils import LogitsProcessorList, StoppingCriteriaL
 
 from .configuration_chatglm import ChatGLMConfig
 
+from edattn import attn_for_glm_bs1
+
 # flags required to enable jit fusion kernels
 
 if sys.platform != 'darwin':
@@ -237,6 +239,7 @@ def apply_rotary_pos_emb_index(q, k, cos, sin, position_id):
     # position_id: [sq, b], q, k: [sq, b, np, hn], cos: [sq, 1, hn] -> [sq, b, 1, hn]
     cos, sin = F.embedding(position_id, cos.squeeze(1)).unsqueeze(2), \
         F.embedding(position_id, sin.squeeze(1)).unsqueeze(2)
+    # print('baseline cos:', cos, cos.shape)
     q, k = (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
     return q, k
 
@@ -269,6 +272,7 @@ def attention_fn(
     query_key_layer_scaling_coeff = float(layer_id + 1)
     if scaling_attention_score:
         query_layer = query_layer / (math.sqrt(hidden_size) * query_key_layer_scaling_coeff)
+        # print('baseline scale:', query_layer)
 
     # ===================================
     # Raw attention scores. [b, np, s, s]
@@ -437,14 +441,18 @@ class SelfAttention(torch.nn.Module):
             layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache: bool = False,
             output_attentions: bool = False,
+            shit_max_len = None,
+            shit_len = None,
+            shit_scale = None,
     ):
         """
         hidden_states: [seq_len, batch, hidden_size]
         attention_mask: [(1, 1), seq_len, seq_len]
         """
-
+        decode_time = (hidden_states.size(0) == 1)
         # [seq_len, batch, 3 * hidden_size]
         mixed_raw_layer = self.query_key_value(hidden_states)
+        # print("baseline after qkv:", mixed_raw_layer.shape, mixed_raw_layer)
 
         # [seq_len, batch, 3 * hidden_size] --> [seq_len, batch, num_attention_heads, 3 * hidden_size_per_attention_head]
         new_tensor_shape = mixed_raw_layer.size()[:-1] + (
@@ -455,6 +463,12 @@ class SelfAttention(torch.nn.Module):
 
         # [seq_len, batch, num_attention_heads, hidden_size_per_attention_head]
         (query_layer, key_layer, value_layer) = self.split_tensor_along_last_dim(mixed_raw_layer, 3)
+
+        if decode_time:
+            print("baseline q before rope:", query_layer.shape, query_layer)
+            # print("baseline k:", key_layer.shape, key_layer)
+            # print("baseline v:", value_layer.shape, value_layer)
+            # import pdb; pdb.set_trace()
 
         if self.position_encoding_2d:
             q1, q2 = query_layer.chunk(2, dim=(query_layer.ndim - 1))
@@ -473,6 +487,10 @@ class SelfAttention(torch.nn.Module):
             query_layer, key_layer = apply_rotary_pos_emb_index(query_layer, key_layer, cos, sin, position_ids)
 
         # [seq_len, batch, hidden_size]
+        if decode_time:
+            print("baseline q after rope:", query_layer.shape, query_layer)
+        #     print("baseline k:", key_layer.shape, key_layer)
+        #     print("baseline v:", value_layer.shape, value_layer)
         context_layer, present, attention_probs = attention_fn(
             self=self,
             query_layer=query_layer,
@@ -485,8 +503,26 @@ class SelfAttention(torch.nn.Module):
             use_cache=use_cache
         )
 
-        output = self.dense(context_layer)
+        # print('baseline context layer', context_layer, context_layer.shape)
 
+
+        output = self.dense(context_layer)
+        # print('baseline output', output, output.shape)
+
+        if hidden_states.size(0) == 1:
+            from edattn import attn_fn_for_glm
+            print(query_layer.shape, query_layer.device)
+            print(key_layer.shape, key_layer.device)
+            print(value_layer.shape, value_layer.device)
+            # import pdb; pdb.set_trace()
+            hongke_output = attn_fn_for_glm(query_layer, 
+                                key_layer,
+                                value_layer,
+                            shit_max_len,
+                            shit_len,
+                            shit_scale,
+                            8)
+            # print('honke output', hongke_output, hongke_output.shape)
         outputs = (output, present)
 
         if output_attentions:
@@ -567,7 +603,9 @@ class GLMBlock(torch.nn.Module):
             params_dtype=torch.float,
             num_layers=28,
             position_encoding_2d=True,
-            empty_init=True
+            empty_init=True,
+            max_batch_size=1,
+            max_seq_len=2048,
     ):
         super(GLMBlock, self).__init__()
         # Set output layer initialization if not provided.
@@ -605,6 +643,26 @@ class GLMBlock(torch.nn.Module):
             params_dtype=params_dtype,
             empty_init=empty_init
         )
+        self.max_batch_size = max_batch_size
+        self.max_seq_len = max_seq_len
+        self.sm_scale = 1 / math.sqrt(hidden_size_per_attention_head)
+        self.hidden_size = hidden_size_per_attention_head
+        # kv cache prep in advance
+        self.cache_k = torch.zeros(
+            (self.max_batch_size, self.max_seq_len, num_attention_heads, hidden_size_per_attention_head), dtype=torch.float16
+        )
+        self.cache_v = torch.zeros(
+            (self.max_batch_size, self.max_seq_len, num_attention_heads, hidden_size_per_attention_head), dtype=torch.float16)
+        
+        self.cache_k = self.cache_k.cuda()
+        self.cache_v = self.cache_v.cuda()
+        self.t = torch.arange(self.max_seq_len, dtype=torch.float32)
+        self.freqs = torch.einsum('i,j->ij', self.t, self.attention.rotary_emb.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        self.emb = torch.cat((self.freqs, self.freqs), dim=-1).cuda()
+        self.decode_count = 0
+        self.len = 0
+
 
     def forward(
             self,
@@ -623,41 +681,194 @@ class GLMBlock(torch.nn.Module):
 
         # Layer norm at the begining of the transformer layer.
         # [seq_len, batch, hidden_size]
-        attention_input = self.input_layernorm(hidden_states)
+        seq_len = hidden_states.size(0)
+        if seq_len > 1:
+            # prefill
+            print("Prefill")
+            attention_input = self.input_layernorm(hidden_states)
 
-        # Self attention.
-        attention_outputs = self.attention(
-            attention_input,
-            position_ids,
-            attention_mask=attention_mask,
-            layer_id=layer_id,
-            layer_past=layer_past,
-            use_cache=use_cache,
-            output_attentions=output_attentions
-        )
+            # Self attention.
+            attention_outputs = self.attention(
+                attention_input,
+                position_ids,
+                attention_mask=attention_mask,
+                layer_id=layer_id,
+                layer_past=layer_past,
+                use_cache=use_cache,
+                output_attentions=output_attentions
+            )
+            attention_output = attention_outputs[0]  # 128, 1, 4096
+            self.len = attention_output.size(0)
 
-        attention_output = attention_outputs[0]
+            outputs = attention_outputs[1:]
 
-        outputs = attention_outputs[1:]
+            # Residual connection.
+            alpha = (2 * self.num_layers) ** 0.5
+            hidden_states = attention_input * alpha + attention_output
 
-        # Residual connection.
-        alpha = (2 * self.num_layers) ** 0.5
-        hidden_states = attention_input * alpha + attention_output
+            mlp_input = self.post_attention_layernorm(hidden_states)
 
-        mlp_input = self.post_attention_layernorm(hidden_states)
+            # MLP.
+            mlp_output = self.mlp(mlp_input)
 
-        # MLP.
-        mlp_output = self.mlp(mlp_input)
+            # Second residual connection.
+            output = mlp_input * alpha + mlp_output
 
-        # Second residual connection.
-        output = mlp_input * alpha + mlp_output
+            if use_cache:
+                outputs = (output,) + outputs
+            else:
+                outputs = (output,) + outputs[1:]
 
-        if use_cache:
-            outputs = (output,) + outputs
-        else:
-            outputs = (output,) + outputs[1:]
+            return outputs
+        
+        elif seq_len == 1:
+            print("Decode basaline")
+            # print("baseline attn input:", hidden_states)
+            hidden_states2 = hidden_states.clone()
+            attention_input = self.input_layernorm(hidden_states)
+            # print('baseline attn layernorm output:', attention_input)
+            # Self attention.
+            query_key_layer_scaling_oeff = float(layer_id + 1)
+            scale = 1 / math.sqrt(self.hidden_size) * query_key_layer_scaling_oeff
+            attention_outputs = self.attention(
+                attention_input,
+                position_ids,
+                attention_mask=attention_mask,
+                layer_id=layer_id,
+                layer_past=layer_past,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                shit_max_len = self.max_seq_len,
+                shit_len = self.len,
+                shit_scale = scale,
+            )
+            attention_output = attention_outputs[0]  # 1, 1, 4096
 
-        return outputs  # hidden_states, present, attentions
+            outputs = attention_outputs[1:]
+
+            # Residual connection.
+            alpha = (2 * self.num_layers) ** 0.5
+            hidden_states = attention_input * alpha + attention_output
+
+            # print('baseline attention output && ffn input:', hidden_states)
+
+            mlp_input = self.post_attention_layernorm(hidden_states)
+
+            # MLP.
+            mlp_output = self.mlp(mlp_input)
+
+            # Second residual connection.
+            output = mlp_input * alpha + mlp_output
+
+            if use_cache:
+                outputs = (output,) + outputs
+            else:
+                outputs = (output,) + outputs[1:]
+
+            ##################OURS#####################
+            print("Decode ours")
+            # self.t = torch.arange(self.max_seq_len, device=hidden_states.device, dtype=self.attention.rotary_emb.inv_freq.dtype)
+            
+            # [1, batch, 3 * hidden_size]
+            ## 
+            # print('ours attention input:', hidden_states2)
+            # print('shape of hidden_state2:', hidden_states2.shape)
+            self.decode_count += 1
+            transposed_hs = torch.transpose(hidden_states2, 1, 0)
+            # print("our qkv weight", self.attention.query_key_value.weight)
+            
+
+            # only need input tensor device in rotary_emb
+            # cos, sin = self.attention.rotary_emb(self.attention.query_key_value, seq_len=position_ids.max() + 1)
+            # position_ids, _ = position_ids[:, 0, :].transpose(0, 1).contiguous(), \
+            #     position_ids[:, 1, :].transpose(0, 1).contiguous()
+            # cos = F.embedding(position_ids, cos.squeeze(1)).unsqueeze(2)
+            # sin = F.embedding(position_ids, sin.squeeze(1)).unsqueeze(2)
+            # freq = torch.cat((self.freqs, self.freqs), dim=-1).cuda()
+            # print('ours cos', cos, cos.shape)
+            # our_attn_outputs = attn_for_glm_bs1(transposed_hs, 
+            #                             self.input_layernorm.weight, 
+            #                             self.attention.query_key_value.weight, 
+            #                             self.attention.dense.weight,
+            #                             self.input_layernorm.bias,
+            #                             self.attention.query_key_value.bias,
+            #                             self.attention.dense.bias,
+            #                             self.cache_k, self.cache_v,
+            #                             freq,
+            #                             self.max_seq_len, self.len, scale, 8, alpha)
+            self.len += 1
+            
+            
+            from edattn import ffn_for_glm_bs1
+            our_ffn_output = ffn_for_glm_bs1(hidden_states, self.post_attention_layernorm.weight, 
+                                 self.mlp.dense_h_to_4h.weight, self.mlp.dense_4h_to_h.weight, 
+                                 self.post_attention_layernorm.bias, 
+                                 self.mlp.dense_h_to_4h.bias, self.mlp.dense_4h_to_h.bias, alpha) 
+            # abs_error = torch.abs(output - our_ffn_output)
+            # mask = torch.gt(abs_error, 0.02)
+            # indices = torch.nonzero(mask)
+            # for idx in indices:
+            #     print(f"index: {idx.tolist()}, Number: {abs_error[tuple(idx)].item()}")
+            ########################
+            import pdb; pdb.set_trace()
+            return (our_ffn_output, None) 
+
+        # elif seq_len == 1: 
+            # print("Decode ours")
+            # self.decode_count += 1
+            # print(self.decode_count)
+            # # self.t = torch.arange(self.max_seq_len, device=hidden_states.device, dtype=self.attention.rotary_emb.inv_freq.dtype)
+            
+            # # [1, batch, 3 * hidden_size]
+            # ## 
+            # transposed_hs = torch.transpose(hidden_states, 1, 0)
+            # attention_outputs = attn_for_glm_bs1(transposed_hs, 
+            #                             self.input_layernorm.weight, 
+            #                             self.attention.query_key_value.weight, 
+            #                             self.attention.dense.weight,
+            #                             self.input_layernorm.bias,
+            #                             self.attention.query_key_value.bias,
+            #                             self.attention.dense.bias,
+            #                             self.cache_k, self.cache_v,
+            #                             self.emb,
+            #                             self.max_seq_len, layer_id, self.sm_scale, 8)
+
+        #     # attention_input = self.input_layernorm(hidden_states)
+
+        #     # # Self attention.
+        #     # attention_outputs = self.attention(
+        #     #     attention_input,
+        #     #     position_ids,
+        #     #     attention_mask=attention_mask,
+        #     #     layer_id=layer_id,
+        #     #     layer_past=layer_past,
+        #     #     use_cache=use_cache,
+        #     #     output_attentions=output_attentions
+        #     # )
+
+        #     # attention_output = attention_outputs[0]
+        #     # outputs = attention_output[1:]
+        #     # outputs = attention_outputs
+        #     # Residual connection. inside attn_for_glm?
+        #     # alpha = (2 * self.num_layers) ** 0.5
+        #     # hidden_states = attention_input * alpha + attention_output
+
+        #     #ffn ################################################################################
+        #     from edattn import ffn_for_glm_bs1
+        #     output = ffn_for_glm_bs1(attention_outputs, self.post_attention_layernorm.weight, 
+        #                          self.mlp.dense_h_to_4h.weight, self.mlp.dense_4h_to_h.weight, 
+        #                          self.post_attention_layernorm.bias, 
+        #                          self.mlp.dense_h_to_4h.bias, self.mlp.dense_4h_to_h.bias)
+
+        #     # mlp_input = self.post_attention_layernorm(hidden_states)
+        #     # output = ffn_for_opt(attention_outputs, transposed_hs, self.post_attention_layernorm.weight, 
+        #     #                      self.mlp.dense_h_to_4h.weight, self.mlp.dense_4h_to_h.weight, 
+        #     #                      self.post_attention_layernorm.bias, 
+        #     #                      self.mlp.dense_h_to_4h.bias, self.mlp.dense_4h_to_h.bias)
+        #     # mlp_input = self.post_attention_layernorm(attention_outputs)
+
+
+        #     return (output, None)  # hidden_states, present, attentions
 
 
 class ChatGLMPreTrainedModel(PreTrainedModel):
@@ -830,7 +1041,9 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
                 use_bias=True,
                 params_dtype=self.params_dtype,
                 position_encoding_2d=self.position_encoding_2d,
-                empty_init=empty_init
+                empty_init=empty_init,
+                max_batch_size=1,
+                max_seq_len=self.max_sequence_length,
             )
 
         self.layers = torch.nn.ModuleList(
